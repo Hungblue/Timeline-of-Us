@@ -1,6 +1,7 @@
 "use client";
 
 import { useState, useEffect } from "react";
+import Link from "next/link";
 import { motion } from "framer-motion";
 import { Heart, LogIn, LogOut, Mail, Lock } from "lucide-react";
 import { supabase } from "@/lib/supabase";
@@ -142,6 +143,15 @@ export default function LoginPage() {
             )}
           </button>
         </form>
+
+        <div className="text-center mt-6">
+          <Link
+            href="/forgot-password"
+            className="text-sm text-rose-400 hover:text-rose-600 transition-colors"
+          >
+            Quên mật khẩu?
+          </Link>
+        </div>
       </motion.div>
     </div>
   );
