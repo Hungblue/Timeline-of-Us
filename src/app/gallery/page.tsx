@@ -15,6 +15,12 @@ interface Photo {
   isStatic?: boolean;
 }
 
+interface PendingPhoto {
+  file: File;
+  preview: string;
+  key: string;
+}
+
 export default function GalleryPage() {
   const [photos, setPhotos] = useState<Photo[]>([]);
   const [isLoggedIn, setIsLoggedIn] = useState(false);
@@ -22,14 +28,28 @@ export default function GalleryPage() {
   const [lightbox, setLightbox] = useState<Photo | null>(null);
   const [uploading, setUploading] = useState(false);
   const [caption, setCaption] = useState("");
-  const [preview, setPreview] = useState<string | null>(null);
+  const [pending, setPending] = useState<PendingPhoto[]>([]);
+  const [progress, setProgress] = useState({ done: 0, total: 0 });
+  const [uploadError, setUploadError] = useState("");
   const fileRef = useRef<HTMLInputElement>(null);
-  const [selectedFile, setSelectedFile] = useState<File | null>(null);
+  const pendingRef = useRef<PendingPhoto[]>([]);
 
   useEffect(() => {
     checkAuth();
     fetchPhotos();
   }, []);
+
+  // Giữ bản mới nhất để cleanup lúc unmount không phải phụ thuộc vào state
+  useEffect(() => {
+    pendingRef.current = pending;
+  }, [pending]);
+
+  useEffect(
+    () => () => {
+      pendingRef.current.forEach((p) => URL.revokeObjectURL(p.preview));
+    },
+    []
+  );
 
   async function checkAuth() {
     if (!isSupabaseConfigured) return;
@@ -64,59 +84,109 @@ export default function GalleryPage() {
   }
 
   function handleFileSelect(e: React.ChangeEvent<HTMLInputElement>) {
-    const file = e.target.files?.[0];
-    if (!file) return;
-    setSelectedFile(file);
-    const reader = new FileReader();
-    reader.onloadend = () => setPreview(reader.result as string);
-    reader.readAsDataURL(file);
+    const picked = Array.from(e.target.files || []).filter((f) =>
+      f.type.startsWith("image/")
+    );
+
+    if (picked.length) {
+      setPending((prev) => {
+        const seen = new Set(prev.map((p) => p.key));
+        const added: PendingPhoto[] = [];
+        for (const file of picked) {
+          const key = `${file.name}-${file.size}`;
+          if (seen.has(key)) continue;
+          seen.add(key);
+          added.push({ file, key, preview: URL.createObjectURL(file) });
+        }
+        return [...prev, ...added];
+      });
+      setUploadError("");
+    }
+
+    // Reset để chọn lại đúng file vừa bỏ ra vẫn kích hoạt onChange
+    e.target.value = "";
   }
 
-  async function uploadPhoto() {
-    if (!selectedFile) return;
+  function removePending(key: string) {
+    setPending((prev) => {
+      const hit = prev.find((p) => p.key === key);
+      if (hit) URL.revokeObjectURL(hit.preview);
+      return prev.filter((p) => p.key !== key);
+    });
+  }
+
+  async function uploadPhotos() {
+    if (!pending.length) return;
+
+    const batch = pending;
     setUploading(true);
+    setUploadError("");
+    setProgress({ done: 0, total: batch.length });
 
-    try {
-      const fileExt = selectedFile.name.split(".").pop();
-      const fileName = `${Date.now()}.${fileExt}`;
-      const filePath = `photos/${fileName}`;
+    const { data: session } = await supabase.auth.getSession();
+    const uploadedBy = session.session?.user?.email || "unknown";
+    const today = new Date().toISOString().split("T")[0];
 
-      const { error: uploadError } = await supabase.storage
-        .from("gallery")
-        .upload(filePath, selectedFile);
+    const rows = [];
+    const failed: string[] = [];
 
-      if (uploadError) throw uploadError;
+    for (let i = 0; i < batch.length; i++) {
+      const { file } = batch[i];
+      try {
+        const ext = file.name.split(".").pop() || "jpg";
+        // Date.now() một mình sẽ trùng khi nhiều file vào cùng mili-giây
+        const rand = Math.random().toString(36).slice(2, 8);
+        const filePath = `photos/${Date.now()}-${i}-${rand}.${ext}`;
 
-      const { data: urlData } = supabase.storage
-        .from("gallery")
-        .getPublicUrl(filePath);
+        const { error: storageError } = await supabase.storage
+          .from("gallery")
+          .upload(filePath, file);
+        if (storageError) throw storageError;
 
-      const { data: session } = await supabase.auth.getSession();
+        const { data: urlData } = supabase.storage
+          .from("gallery")
+          .getPublicUrl(filePath);
 
-      const { data } = await supabase
+        rows.push({
+          url: urlData.publicUrl,
+          caption: batch.length === 1 ? caption : "",
+          date: today,
+          uploaded_by: uploadedBy,
+        });
+      } catch (err) {
+        const msg = err instanceof Error ? err.message : "lỗi không rõ";
+        failed.push(`${file.name} (${msg})`);
+      } finally {
+        setProgress({ done: i + 1, total: batch.length });
+      }
+    }
+
+    // Gom cả lô insert một lần thay vì mỗi ảnh một round trip
+    if (rows.length) {
+      const { data, error } = await supabase
         .from("photos")
-        .insert([
-          {
-            url: urlData.publicUrl,
-            caption: caption,
-            date: new Date().toISOString().split("T")[0],
-            uploaded_by: session.session?.user?.email || "unknown",
-          },
-        ])
-        .select()
-        .single();
+        .insert(rows)
+        .select();
+      if (error) {
+        failed.push(`không lưu được vào danh sách (${error.message})`);
+      } else if (data) {
+        setPhotos((prev) => [...data, ...prev]);
+      }
+    }
 
-      if (data) setPhotos((prev) => [data, ...prev]);
+    batch.forEach((p) => URL.revokeObjectURL(p.preview));
+    setPending([]);
+    setCaption("");
+    setProgress({ done: 0, total: 0 });
+    setUploading(false);
 
-      setCaption("");
-      setPreview(null);
-      setSelectedFile(null);
+    // Ảnh thành công vẫn được giữ, chỉ báo lại phần hỏng
+    if (failed.length) {
+      setUploadError(
+        `${failed.length}/${batch.length} ảnh lỗi: ${failed.join("; ")}`
+      );
+    } else {
       setShowUpload(false);
-    } catch (err) {
-      console.error("Upload error:", err);
-      alert("Upload thất bại. Hãy kiểm tra cấu hình Supabase.");
-    } finally {
-      setUploading(false);
     }
   }
 
@@ -174,51 +244,97 @@ export default function GalleryPage() {
                 ref={fileRef}
                 type="file"
                 accept="image/*"
+                multiple
                 onChange={handleFileSelect}
                 className="hidden"
               />
 
-              {preview ? (
-                <div className="relative mb-4">
-                  <img
-                    src={preview}
-                    alt="Preview"
-                    className="w-full h-48 object-cover rounded-xl"
-                  />
-                  <button
-                    onClick={() => {
-                      setPreview(null);
-                      setSelectedFile(null);
-                    }}
-                    className="absolute top-2 right-2 w-8 h-8 bg-black/50 rounded-full flex items-center justify-center text-white hover:bg-black/70"
-                  >
-                    <X className="w-4 h-4" />
-                  </button>
-                </div>
-              ) : (
+              {pending.length === 0 ? (
                 <button
                   onClick={() => fileRef.current?.click()}
                   className="w-full h-48 border-2 border-dashed border-rose-200 rounded-xl flex flex-col items-center justify-center text-rose-300 hover:border-rose-400 hover:text-rose-400 transition-colors mb-4"
                 >
                   <Upload className="w-8 h-8 mb-2" />
                   <span className="text-sm">Chọn ảnh để upload</span>
+                  <span className="text-xs mt-1 opacity-70">
+                    Chọn được nhiều ảnh cùng lúc
+                  </span>
                 </button>
+              ) : (
+                <>
+                  {pending.length === 1 ? (
+                    <div className="relative mb-3">
+                      <img
+                        src={pending[0].preview}
+                        alt="Preview"
+                        className="w-full h-48 object-cover rounded-xl"
+                      />
+                      <button
+                        onClick={() => removePending(pending[0].key)}
+                        className="absolute top-2 right-2 w-8 h-8 bg-black/50 rounded-full flex items-center justify-center text-white hover:bg-black/70"
+                      >
+                        <X className="w-4 h-4" />
+                      </button>
+                    </div>
+                  ) : (
+                    <div className="grid grid-cols-3 gap-2 mb-3">
+                      {pending.map((p) => (
+                        <div
+                          key={p.key}
+                          className="relative aspect-square group/thumb"
+                        >
+                          <img
+                            src={p.preview}
+                            alt={p.file.name}
+                            className="w-full h-full object-cover rounded-lg"
+                          />
+                          <button
+                            onClick={() => removePending(p.key)}
+                            className="absolute top-1 right-1 w-6 h-6 bg-black/60 rounded-full flex items-center justify-center text-white hover:bg-red-500 transition-colors"
+                          >
+                            <X className="w-3 h-3" />
+                          </button>
+                        </div>
+                      ))}
+                    </div>
+                  )}
+
+                  <button
+                    onClick={() => fileRef.current?.click()}
+                    disabled={uploading}
+                    className="w-full py-2 mb-4 text-sm text-rose-400 border border-dashed border-rose-200 rounded-xl hover:border-rose-400 hover:text-rose-600 transition-colors disabled:opacity-50"
+                  >
+                    + Thêm ảnh
+                  </button>
+                </>
               )}
 
-              <input
-                type="text"
-                placeholder="Caption (tuỳ chọn)"
-                value={caption}
-                onChange={(e) => setCaption(e.target.value)}
-                className="w-full px-4 py-3 rounded-xl border border-rose-200 focus:outline-none focus:ring-2 focus:ring-rose-300 bg-rose-50/50 mb-4"
-              />
+              {pending.length === 1 && (
+                <input
+                  type="text"
+                  placeholder="Caption (tuỳ chọn)"
+                  value={caption}
+                  onChange={(e) => setCaption(e.target.value)}
+                  className="w-full px-4 py-3 rounded-xl border border-rose-200 focus:outline-none focus:ring-2 focus:ring-rose-300 bg-rose-50/50 mb-4"
+                />
+              )}
+
+              {uploadError && (
+                <p className="text-red-500 text-sm bg-red-50 p-3 rounded-xl mb-4 break-words">
+                  {uploadError}
+                </p>
+              )}
 
               <button
-                onClick={uploadPhoto}
-                disabled={!selectedFile || uploading}
+                onClick={uploadPhotos}
+                disabled={!pending.length || uploading}
                 className="w-full py-3 bg-rose-500 text-white rounded-xl hover:bg-rose-600 transition-colors font-medium disabled:opacity-50 disabled:cursor-not-allowed"
               >
-                {uploading ? "Đang upload..." : "Upload"}
+                {uploading
+                  ? `Đang upload ${progress.done}/${progress.total}...`
+                  : pending.length > 1
+                  ? `Upload ${pending.length} ảnh`
+                  : "Upload"}
               </button>
             </div>
           </motion.div>
